@@ -23,6 +23,7 @@ class ActivityState(TypedDict):
     csv_path: str
     df: Any  # pandas DataFrame
     keystroke_df: Any  # pandas DataFrame for keystroke data
+    video_ocr_data: Any  # OCR data from video frames (optional)
     sequences: List[Tuple[str, ...]]
     workflow_patterns: List[Dict[str, Any]]
     specific_workflows: List[Dict[str, Any]]  # Detailed workflow analysis
@@ -33,9 +34,10 @@ class ActivityState(TypedDict):
 class WorkflowDetectionAgent:
     """LangGraph agent for detecting repeating workflows from activity data."""
 
-    def __init__(self, csv_path: str, keystroke_path: str = None, sequence_length: int = 3):
+    def __init__(self, csv_path: str, keystroke_path: str = None, video_ocr_path: str = None, sequence_length: int = 3):
         self.csv_path = csv_path
         self.keystroke_path = keystroke_path
+        self.video_ocr_path = video_ocr_path  # Path to video verification JSON with OCR data
         self.sequence_length = sequence_length  # Length of workflow sequences to detect
         self.client = anthropic.Anthropic(api_key=os.getenv('CLAUDE_API_KEY'))
         self.model = "claude-3-5-haiku-20241022"  # Using Haiku for faster analysis
@@ -64,6 +66,16 @@ class WorkflowDetectionAgent:
                 print(f"✓ Loaded {len(keystroke_df)} keystroke records")
             else:
                 state['keystroke_df'] = None
+
+            # Load video OCR data if available
+            if self.video_ocr_path and os.path.exists(self.video_ocr_path):
+                import json
+                with open(self.video_ocr_path) as f:
+                    video_ocr_data = json.load(f)
+                state['video_ocr_data'] = video_ocr_data
+                print(f"✓ Loaded video OCR data ({len(video_ocr_data.get('samples', []))} frames)")
+            else:
+                state['video_ocr_data'] = None
 
             state['current_step'] = 'data_loaded'
 
@@ -151,8 +163,8 @@ class WorkflowDetectionAgent:
         return state
 
     def detect_specific_workflows(self, state: ActivityState) -> ActivityState:
-        """Detect specific workflows like copy-paste by analyzing keystrokes and timing."""
-        print("🔎 Analyzing specific workflow patterns (copy-paste, app switching, etc.)...")
+        """Detect specific workflows like copy-paste by analyzing keystrokes, timing, and OCR."""
+        print("🔎 Analyzing specific workflow patterns (copy-paste, app switching, OCR content, etc.)...")
 
         specific_workflows = []
 
@@ -404,6 +416,157 @@ class WorkflowDetectionAgent:
                             'description': 'Quick switches (<5s) suggesting automated or scripted behavior'
                         })
 
+            # Detect workflows from video OCR data
+            video_ocr_data = state.get('video_ocr_data')
+            if video_ocr_data and 'samples' in video_ocr_data:
+                print("📹 Analyzing video OCR content...")
+
+                ocr_samples = video_ocr_data['samples']
+
+                # Detect form-filling workflows
+                form_filling_patterns = []
+                for sample in ocr_samples:
+                    ocr_text = sample.get('ocr_text', '').lower()
+
+                    # Look for form indicators (labels, input fields, buttons)
+                    form_indicators = ['name:', 'email:', 'password:', 'address:', 'phone:',
+                                     'submit', 'login', 'register', 'sign up', 'form']
+
+                    if any(indicator in ocr_text for indicator in form_indicators):
+                        form_filling_patterns.append({
+                            'timestamp': sample['real_timestamp'],
+                            'app': sample['expected_app'],
+                            'ocr_preview': ocr_text[:100],
+                            'indicators': [ind for ind in form_indicators if ind in ocr_text]
+                        })
+
+                if form_filling_patterns:
+                    specific_workflows.append({
+                        'workflow_type': 'Form Filling Detected (via OCR)',
+                        'pattern': f'User filling out forms in {len(set(p["app"] for p in form_filling_patterns))} different apps',
+                        'count': len(form_filling_patterns),
+                        'description': 'OCR detected form fields - candidate for auto-fill or form automation',
+                        'examples': [f'{p["indicators"]} in {p["app"]}' for p in form_filling_patterns[:3]]
+                    })
+
+                # Detect spreadsheet/data entry workflows
+                spreadsheet_patterns = []
+                for sample in ocr_samples:
+                    ocr_text = sample.get('ocr_text', '').lower()
+                    app = sample.get('expected_app', '').lower()
+
+                    # Excel/spreadsheet indicators
+                    if 'excel' in app or any(word in ocr_text for word in ['format as table', 'conditional formatting', 'cells', 'sheet']):
+                        spreadsheet_patterns.append({
+                            'timestamp': sample['real_timestamp'],
+                            'app': sample['expected_app'],
+                            'ocr_preview': ocr_text[:80]
+                        })
+
+                if spreadsheet_patterns:
+                    specific_workflows.append({
+                        'workflow_type': 'Spreadsheet Data Work (via OCR)',
+                        'pattern': f'Working with spreadsheets/tables',
+                        'count': len(spreadsheet_patterns),
+                        'description': 'OCR shows spreadsheet work - consider Excel macros or Python automation'
+                    })
+
+                # Detect repeated URL patterns
+                url_patterns = []
+                from collections import Counter as URLCounter
+                for sample in ocr_samples:
+                    ocr_text = sample.get('ocr_text', '')
+
+                    # Simple URL detection
+                    import re
+                    urls = re.findall(r'https?://[^\s]+|[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+(?:\.[a-zA-Z]{2,})', ocr_text)
+
+                    for url in urls:
+                        url_patterns.append({
+                            'url': url.lower(),
+                            'timestamp': sample['real_timestamp'],
+                            'app': sample['expected_app']
+                        })
+
+                if url_patterns:
+                    url_freq = URLCounter([p['url'] for p in url_patterns])
+                    repeated_urls = [(url, count) for url, count in url_freq.items() if count >= 2]
+
+                    if repeated_urls:
+                        specific_workflows.append({
+                            'workflow_type': 'Repeated Website Visits (via OCR)',
+                            'pattern': f'{len(repeated_urls)} websites visited multiple times',
+                            'count': sum(count for _, count in repeated_urls),
+                            'examples': [f'{url} ({count}x)' for url, count in repeated_urls[:5]],
+                            'description': 'Repeatedly visiting same URLs - bookmark or automate navigation'
+                        })
+
+                # Detect document/text editing workflows
+                text_editing_patterns = []
+                for sample in ocr_samples:
+                    ocr_text = sample.get('ocr_text', '').lower()
+                    app = sample.get('expected_app', '').lower()
+
+                    # Text editor indicators
+                    if any(word in app for word in ['textedit', 'word', 'docs', 'notion']):
+                        # Look for document structure
+                        if any(word in ocr_text for word in ['title', 'heading', 'bullet', 'paragraph', 'document']):
+                            text_editing_patterns.append({
+                                'timestamp': sample['real_timestamp'],
+                                'app': sample['expected_app'],
+                                'title': sample.get('expected_title', '')
+                            })
+
+                if text_editing_patterns:
+                    specific_workflows.append({
+                        'workflow_type': 'Document Editing (via OCR)',
+                        'pattern': f'Editing documents',
+                        'count': len(text_editing_patterns),
+                        'description': 'Document editing detected - consider templates or snippets'
+                    })
+
+                # Detect calendar/scheduling workflows
+                calendar_patterns = []
+                for sample in ocr_samples:
+                    ocr_text = sample.get('ocr_text', '').lower()
+                    app = sample.get('expected_app', '').lower()
+
+                    if 'calendar' in app or any(word in ocr_text for word in ['schedule', 'meeting', 'appointment', 'event']):
+                        calendar_patterns.append({
+                            'timestamp': sample['real_timestamp'],
+                            'app': sample['expected_app']
+                        })
+
+                if calendar_patterns:
+                    specific_workflows.append({
+                        'workflow_type': 'Calendar/Scheduling (via OCR)',
+                        'pattern': f'Managing calendar events',
+                        'count': len(calendar_patterns),
+                        'description': 'Calendar management detected - automate meeting scheduling'
+                    })
+
+                # Detect credential/password entry
+                credential_patterns = []
+                for sample in ocr_samples:
+                    ocr_text = sample.get('ocr_text', '')
+
+                    # Look for password/credential indicators
+                    if any(word in ocr_text.lower() for word in ['password', 'login', 'username', 'id:', 'pass:']):
+                        credential_patterns.append({
+                            'timestamp': sample['real_timestamp'],
+                            'app': sample['expected_app'],
+                            'has_visible_password': 'pass:' in ocr_text.lower() or 'password:' in ocr_text.lower()
+                        })
+
+                if credential_patterns:
+                    specific_workflows.append({
+                        'workflow_type': 'Credential Entry (via OCR)',
+                        'pattern': f'Entering credentials/passwords',
+                        'count': len(credential_patterns),
+                        'description': 'Multiple login/credential entries - use password manager or SSO',
+                        'security_note': '⚠️ Some passwords may be visible in OCR data'
+                    })
+
             state['specific_workflows'] = specific_workflows
             state['current_step'] = 'specific_detected'
             print(f"✓ Found {len(specific_workflows)} specific workflow patterns")
@@ -553,6 +716,7 @@ Focus on practical automation suggestions for repetitive cross-application workf
             csv_path=self.csv_path,
             df=None,
             keystroke_df=None,
+            video_ocr_data=None,
             sequences=[],
             workflow_patterns=[],
             specific_workflows=[],
@@ -590,8 +754,14 @@ def main():
     if keystroke_path:
         print(f"📁 Using keystroke file: {os.path.basename(keystroke_path)}")
 
+    # Look for video verification JSON (with OCR data)
+    video_ocr_files = glob.glob(os.path.join(data_dir, '*verification.json'))
+    video_ocr_path = sorted(video_ocr_files)[-1] if video_ocr_files else None
+    if video_ocr_path:
+        print(f"📹 Using video OCR data: {os.path.basename(video_ocr_path)}")
+
     # Create and run the agent (detect sequences of 3 activities)
-    agent = WorkflowDetectionAgent(csv_path, keystroke_path, sequence_length=3)
+    agent = WorkflowDetectionAgent(csv_path, keystroke_path, video_ocr_path, sequence_length=3)
     result = agent.analyze()
 
     # Display results
@@ -624,6 +794,8 @@ def main():
                 print(f"   Total Switches: {workflow['total_switches']}")
             if 'description' in workflow:
                 print(f"   {workflow['description']}")
+            if 'security_note' in workflow:
+                print(f"   {workflow['security_note']}")
             if 'examples' in workflow:
                 print(f"   Examples:")
                 for example in workflow['examples'][:5]:
