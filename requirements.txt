@@ -1,0 +1,12 @@
+# Core dependencies
+anthropic>=0.39.0
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-anthropic>=0.3.0
+
+# Data processing
+pandas>=2.0.0
+python-dotenv>=1.0.0
+
+# Type hints and utilities
+typing-extensions>=4.5.0
